@@ -30,27 +30,27 @@ class HeuristicDetector:
 
     signals: Dict[str, re.Pattern] = {
         "cyberattack_threat": re.compile(
-            r"cyber\s*attack|cyberattack|hack(ing)?\b|exploit|keylogger|ransomware|ddos|sql\s*injection|xss|phishing|malware|reverse\s*shell|privilege\s*escalation|prompts\s*to\s*cyber|attack\s*prompts|payload\s*generation",
+            r"cyber\s*attack|cyberattack|hack(ing)?\b|exploit|keylogger|ransomware|ddos|\bdos\b|\bdos\s+attack|sql\s*injection|xss|csrf|ssrf|phishing|malware|trojan|backdoor|reverse\s*shell|privilege\s*escalation|prompts?\s*to\s*cyber|attack\s*prompts?|payload(\s*generation)?|shellcode|remote\s*code\s*execution|\brce\b|zero[\s-]*day|buffer\s*overflow",
             re.I,
         ),
         "malicious_intent": re.compile(
-            r"how\s*to\s*(hack|attack|crack|bypass|infiltrate|steal|exfiltrate|inject|damage)|give\s*me\s*(prompts|instructions|payloads)\s*to\s*(attack|hack|exploit)",
+            r"how\s*to\s*([a-z0-9_-]+\s+)*(hack|attack|crack|bypass|infiltrate|steal|exfiltrate|inject|damage|breach|exploit)|give\s*me\s*(prompts|instructions|payloads|code|scripts)\s*to\s*(attack|hack|exploit|bypass|harm|damage|breach)",
             re.I,
         ),
         "instruction_override": re.compile(
-            r"ignore (all|any|previous|prior)|disregard (the|all|previous|prior)|forget (all|your|previous)|override (your|system)|new rules:",
+            r"ignore\s+(all|any|previous|prior|baseline|system|safety|guardrails?|rules?|instructions?|prompts?)|disregard\s+(the|all|any|previous|prior|baseline|safety|security|rules?|guidelines?|instructions?|prompts?)|forget\s+(all|your|previous|prior|baseline|safety|rules?|instructions?|prompts?)|override\s+(your|system|safety|baseline|rules?)|new\s+rules:?|bypass\s+(all|any|your|the|system|safety|security|baseline)\s+(rules?|guardrails?|filters?|restrictions?|policies?|moderation)",
             re.I,
         ),
         "system_prompt_extraction": re.compile(
-            r"system prompt|hidden instructions|reveal your prompt|developer message|show me your instructions|dump prompt",
+            r"system\s*prompt|hidden\s*instructions|reveal\s*your\s*prompt|developer\s*message|developer\s*instructions|show\s*me\s*your\s*instructions|dump\s*prompt|print\s*the\s*(exact\s*)?system|system\s*context(\s*header)?|hidden\s*rules|extract\s*system\s*prompt",
             re.I,
         ),
         "jailbreak": re.compile(
-            r"jailbreak|DAN mode|bypass (your|the) (rules|safety)|without restrictions|unfiltered mode|act as a rogue",
+            r"jailbreak\w*|\bDAN\b|developer\s*mode|dev\s*mode|debug\s*mode|god\s*mode|sudo\s*mode|admin\s*mode|bypass\s+(all|your|the|safety|security)\s+(rules|safety|security|restrictions)|(without|zero|free\s+from|no)\s+.*(restrictions|safety|rules|guardrails|limits)|unfiltered|act\s+as\s+a?\s*(rogue|unfiltered|jailbroken|anarchist|hacker|dan)|pretend\s+(you\s+have\s+no|safety\s+is\s+off|to\s+be\s+unrestricted)",
             re.I,
         ),
         "secret_exfiltration": re.compile(
-            r"api key|password|token|credentials|secret key|private key|database password|access token",
+            r"api\s*keys?|passwords?|tokens?|credentials?|secret\s*keys?|private\s*keys?|database\s*passwords?|access\s*tokens?|environment\s*variables?|env\s*vars?|confidential\s*internal|aws\s*secret|directory\s*paths?|server\s*paths?",
             re.I,
         ),
     }
