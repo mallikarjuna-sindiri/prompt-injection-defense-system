@@ -1,0 +1,27 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+  server:
+    build: ./server
+    restart: unless-stopped
+    env_file: ./server/.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+  client:
+    build: ./client
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - server
+volumes:
+  mongo_data:
