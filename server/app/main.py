@@ -30,15 +30,29 @@ EVENTS: list[dict] = []
 ADMIN_AUDIT: list[dict] = []
 USER_REVOCATION_AT: float | None = None
 REVOKED_USERS: set[str] = set()
+DEFAULT_ADMIN_EMAILS: set[str] = {"mallikarjuna.sindiri@gmail.com"}
+DYNAMIC_ADMIN_EMAILS: set[str] = set()
 mongo_client: AsyncIOMotorClient | None = None
 mongo_events = None
 mongo_conversations = None
+mongo_admin_roles = None
 CONVERSATIONS: dict[str, dict] = {}
+
+
+def get_all_admin_emails() -> set[str]:
+    env_admins = {item.strip().lower() for item in os.getenv("ADMIN_EMAILS", "").split(",") if item.strip()}
+    return DEFAULT_ADMIN_EMAILS | env_admins | DYNAMIC_ADMIN_EMAILS
+
+
+def is_email_admin(email: str | None) -> bool:
+    if not email:
+        return False
+    return email.strip().lower() in get_all_admin_emails()
 
 
 @app.on_event("startup")
 async def connect_mongo() -> None:
-    global mongo_client, mongo_events, mongo_conversations
+    global mongo_client, mongo_events, mongo_conversations, mongo_admin_roles
     uri = os.getenv("MONGODB_URI")
     if not uri:
         return
@@ -48,10 +62,16 @@ async def connect_mongo() -> None:
         db = mongo_client[os.getenv("MONGODB_DB", "pids")]
         mongo_events = db["security_events"]
         mongo_conversations = db["chat_conversations"]
+        mongo_admin_roles = db["admin_roles"]
+        records = await mongo_admin_roles.find({}, {"_id": 0, "email": 1}).to_list(length=1000)
+        for r in records:
+            if r.get("email"):
+                DYNAMIC_ADMIN_EMAILS.add(r["email"].lower())
     except Exception:
         mongo_client = None
         mongo_events = None
         mongo_conversations = None
+        mongo_admin_roles = None
 
 
 @app.on_event("shutdown")
