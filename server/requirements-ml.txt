@@ -1,0 +1,11 @@
+# These versions publish wheels for the project's Python 3.14 development
+# environment as well as the Python 3.12 container runtime.
+datasets==4.8.5
+dill==0.4.1
+numpy==2.5.4
+pandas==3.1.1
+scikit-learn==1.9.1
+torch==2.15.0
+transformers==4.57.6
+accelerate==1.15.0
+safetensors==0.8.0

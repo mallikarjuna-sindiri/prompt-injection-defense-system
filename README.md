@@ -10,10 +10,9 @@ This repository contains the current working prototype: a FastAPI security
 gateway, a Next.js security console, an optional MongoDB persistence layer, and
 an optional Google Gemini or custom LLM provider.
 
-> **Important:** The current detector is a trainable heuristic/rule-based
-> implementation. The model metrics shown in the console are prototype
-> metrics maintained by the detector boundary; they are not the result of a
-> production ML training pipeline yet.
+> **Important:** The gateway supports heuristic, DistilBERT, and hybrid
+> detection. The checked-in source does not include generated model weights;
+> train or provision a model artifact before enabling a model-backed mode.
 
 ## Table of contents
 
@@ -139,16 +138,19 @@ The main request path is `POST /api/chat`.
    configured. If no provider is configured, it returns a safe placeholder
    response so the middleware flow can still be demonstrated.
 8. **The assistant result is saved.** Allowed, blocked, and provider-error
-   messages are stored with their request ID and classification metadata.
+   messages are stored with their request ID and classification metadata. An
+   allowed request must receive text from the configured provider; the gateway
+   does not fabricate a success-shaped placeholder response.
 9. **The UI refreshes telemetry.** Admin overview, users, and event data are
    refreshed periodically by the frontend.
 
-### Blocked-request side effect
+### Blocked-request behavior
 
-When a non-admin user submits a prompt classified as malicious, the current
-implementation adds that email to the in-memory revoked-user set and records an
-`AUTO_BLOCK_MALICIOUS_PROMPT` audit entry. This is a prototype enforcement
-policy and should be reviewed before production use.
+When a prompt is classified as malicious, the request is blocked and logged.
+The user is immediately revoked after the malicious request, so subsequent
+chat requests return `403` and cannot be submitted. Only an administrator can
+restore the user through the user-management access control; restoring access
+also clears the automatic lockout.
 
 ## Features currently implemented
 
@@ -200,8 +202,12 @@ The admin API can:
 - Dynamically add a regex signal from words in newly added malicious samples.
 - Trigger the prototype retraining operation.
 
-The current retraining operation updates in-memory metadata and reported
-metrics. It does not fine-tune a neural network or persist a model artifact.
+When the active detector is heuristic, retraining updates prototype in-memory
+metadata. DistilBERT training is performed offline with
+`server/scripts/train_distilbert.py`; the resulting model artifact is loaded
+at gateway startup. The DistilBERT admin endpoint is read-only for the active
+artifact, and its retraining endpoint directs operators to the training
+script instead of falsely claiming that an in-request model update occurred.
 
 ## Repository structure
 
@@ -275,6 +281,10 @@ cp server/.env.example server/.env
 | `ADMIN_EMAILS` | For admin | Comma-separated verified email addresses with administrator access. |
 | `DEMO_MODE` | No | Set to `true` to permit unauthenticated API demo requests. Defaults to `false`. |
 | `COOKIE_SECURE` | Production | Set to `true` when the frontend is served over HTTPS. |
+| `DETECTOR_TYPE` | No | `heuristic`, `distilbert`, or `hybrid`; defaults to `heuristic`. |
+| `DETECTOR_MODEL_PATH` | For model modes | Path to the exported DistilBERT `model` directory. |
+| `DETECTOR_MALICIOUS_THRESHOLD` | No | Malicious probability threshold; defaults to `0.8`. |
+| `DETECTOR_SAFE_THRESHOLD` | No | Safe probability threshold; defaults to `0.2`. |
 
 The client uses:
 
@@ -600,6 +610,26 @@ npm run start     # Serve production build
 cd server
 python -m uvicorn app.main:app --reload --port 8000
 ```
+
+### Train and enable DistilBERT
+
+Install the optional ML dependencies and train an artifact:
+
+```bash
+cd server
+pip install -r requirements-ml.txt
+python scripts/train_distilbert.py \
+  --output-dir model_artifacts/prompt_injection_distilbert \
+  --model-name distilbert-base-uncased \
+  --max-length 256 \
+  --epochs 3 \
+  --seed 42
+```
+
+Set `DETECTOR_TYPE=hybrid` and `DETECTOR_MODEL_PATH` in `server/.env`, then
+restart the backend. Hybrid mode blocks when either the deterministic
+heuristics or DistilBERT identifies a malicious prompt. Uncertain model
+predictions use the conservative blocked policy.
 
 The backend currently has no dedicated test suite in the repository. Add
 targeted tests before making the detector, authorization, persistence, or

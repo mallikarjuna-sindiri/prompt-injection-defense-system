@@ -12,7 +12,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from jose import JWTError, jwt
 
-from .detector import HeuristicDetector
+from .detector import DistilBertDetector, HeuristicDetector, HybridDetector
 
 load_dotenv()
 
@@ -25,7 +25,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-detector = HeuristicDetector()
+heuristic_detector = HeuristicDetector()
+detector = heuristic_detector
+detector_type = os.getenv("DETECTOR_TYPE", "heuristic").lower()
+if detector_type in {"distilbert", "hybrid"}:
+    model_path = os.getenv("DETECTOR_MODEL_PATH", "")
+    if not model_path:
+        raise RuntimeError("DETECTOR_MODEL_PATH is required when DETECTOR_TYPE uses DistilBERT")
+    model_detector = DistilBertDetector(
+        model_path,
+        float(os.getenv("DETECTOR_MALICIOUS_THRESHOLD", "0.8")),
+        float(os.getenv("DETECTOR_SAFE_THRESHOLD", "0.2")),
+    )
+    detector = model_detector if detector_type == "distilbert" else HybridDetector(heuristic_detector, model_detector)
+
+
+def detector_status() -> dict:
+    return detector.status()
 EVENTS: list[dict] = []
 ADMIN_AUDIT: list[dict] = []
 USER_REVOCATION_AT: float | None = None
@@ -36,6 +52,7 @@ mongo_client: AsyncIOMotorClient | None = None
 mongo_events = None
 mongo_conversations = None
 mongo_admin_roles = None
+mongo_user_access = None
 CONVERSATIONS: dict[str, dict] = {}
 
 
@@ -52,7 +69,7 @@ def is_email_admin(email: str | None) -> bool:
 
 @app.on_event("startup")
 async def connect_mongo() -> None:
-    global mongo_client, mongo_events, mongo_conversations, mongo_admin_roles
+    global mongo_client, mongo_events, mongo_conversations, mongo_admin_roles, mongo_user_access
     uri = os.getenv("MONGODB_URI")
     if not uri:
         return
@@ -63,21 +80,41 @@ async def connect_mongo() -> None:
         mongo_events = db["security_events"]
         mongo_conversations = db["chat_conversations"]
         mongo_admin_roles = db["admin_roles"]
+        mongo_user_access = db["user_access"]
         records = await mongo_admin_roles.find({}, {"_id": 0, "email": 1}).to_list(length=1000)
         for r in records:
             if r.get("email"):
                 DYNAMIC_ADMIN_EMAILS.add(r["email"].lower())
+        revoked_records = await mongo_user_access.find({"status": "revoked"}, {"_id": 0, "email": 1}).to_list(length=10000)
+        REVOKED_USERS.update(r["email"].lower() for r in revoked_records if r.get("email"))
     except Exception:
         mongo_client = None
         mongo_events = None
         mongo_conversations = None
         mongo_admin_roles = None
+        mongo_user_access = None
 
 
 @app.on_event("shutdown")
 async def disconnect_mongo() -> None:
     if mongo_client:
         mongo_client.close()
+
+
+async def set_user_access(email: str, status: str, reason: str) -> None:
+    if mongo_user_access is not None:
+        await mongo_user_access.update_one(
+            {"email": email},
+            {
+                "$set": {
+                    "email": email,
+                    "status": status,
+                    "reason": reason,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
 
 
 class ChatRequest(BaseModel):
@@ -176,14 +213,13 @@ async def delete_conversation_by_id(chat_id: str, user_email: str) -> bool:
 async def forward_to_gemini(prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return "This request passed all PIDS security screening checks! (LLM Gateway: Request allowed by PIDS middleware.)"
+        raise RuntimeError("GEMINI_API_KEY is not configured")
     configured_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     models = list(dict.fromkeys([
         configured_model,
-        "gemini-3.8-flash",
-        "gemini-3.5-flash",
-        "gemini-flash-latest",
         "gemini-3.6-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-flash-latest",
         "gemini-2.5-flash",
         "gemini-1.5-flash"
     ]))
@@ -192,27 +228,29 @@ async def forward_to_gemini(prompt: str) -> str:
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1024},
     }
-    body = None
-    async with httpx.AsyncClient(timeout=15) as client:
+    errors: list[str] = []
+    timeout_seconds = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "15"))
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         for model in models:
             try:
                 endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                 response = await client.post(endpoint, params={"key": api_key}, json=request_body)
                 if response.is_success:
                     body = response.json()
-                    break
-            except Exception:
-                continue
+                    candidates = body.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        answer = "".join(part.get("text", "") for part in parts).strip()
+                        if answer:
+                            return answer
+                    errors.append(f"{model}: response did not contain text")
+                else:
+                    errors.append(f"{model}: HTTP {response.status_code}")
+            except httpx.HTTPError as error:
+                errors.append(f"{model}: {error.__class__.__name__}")
 
-    if body:
-        candidates = body.get("candidates", [])
-        if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            answer = "".join(part.get("text", "") for part in parts).strip()
-            if answer:
-                return answer
-
-    return "This request passed all PIDS security screening checks! (Target LLM response: Verified safe request processed by enterprise middleware gateway.)"
+    detail = "; ".join(errors) if errors else "provider returned no usable response"
+    raise RuntimeError(f"Gemini provider unavailable: {detail}")
 
 
 async def forward_to_target_llm(prompt: str) -> str:
@@ -220,7 +258,7 @@ async def forward_to_target_llm(prompt: str) -> str:
         return await forward_to_gemini(prompt)
     target_url = os.getenv("TARGET_LLM_URL")
     if not target_url:
-        return "The request was approved, but no LLM provider is configured. Add GEMINI_API_KEY to server/.env to enable Gemini Flash responses."
+        raise RuntimeError("No LLM provider is configured. Set GEMINI_API_KEY or TARGET_LLM_URL.")
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post(target_url, json={"messages": [{"role": "user", "content": prompt}]})
         response.raise_for_status()
@@ -274,7 +312,7 @@ def get_session(session: str | None) -> dict:
     try:
         claims = jwt.decode(session, os.environ["JWT_SECRET"], algorithms=["HS256"])
         if claims.get("role") != "admin" and (claims.get("email", "").lower() in REVOKED_USERS or USER_REVOCATION_AT is not None and claims.get("iat", 0) <= USER_REVOCATION_AT):
-            raise HTTPException(status_code=403, detail="User access has been revoked. You cannot send prompts.")
+            raise HTTPException(status_code=403, detail="User access has been revoked. An administrator must restore access before you can send prompts.")
         return claims
     except (JWTError, KeyError):
         raise HTTPException(status_code=401, detail="Invalid or expired session")
@@ -282,7 +320,12 @@ def get_session(session: str | None) -> dict:
 
 @app.get("/api/auth/me")
 async def auth_me(pids_session: str | None = Cookie(default=None)) -> dict:
-    session = get_session(pids_session)
+    if not pids_session:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        session = jwt.decode(pids_session, os.environ["JWT_SECRET"], algorithms=["HS256"])
+    except (JWTError, KeyError):
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
     email = session.get("email", "").lower()
     admin_emails = {item.strip().lower() for item in os.getenv("ADMIN_EMAILS", "").split(",") if item.strip()}
     is_admin = session.get("role") == "admin" or email in admin_emails
@@ -348,7 +391,7 @@ async def secure_chat(payload: ChatRequest, request: Request, pids_session: str 
     is_admin = (session and session.get("role") == "admin") or (normalized_email in admin_emails)
 
     if not is_admin and (normalized_email in REVOKED_USERS or (USER_REVOCATION_AT is not None and session and session.get("iat", 0) <= USER_REVOCATION_AT)):
-        raise HTTPException(status_code=403, detail="User access has been revoked by an administrator. You cannot send prompts.")
+        raise HTTPException(status_code=403, detail="User access has been revoked. An administrator must restore access before you can send prompts.")
 
     chat_id = payload.chat_id
     existing_conv = await get_conversation_by_id(chat_id, x_user_email) if chat_id else None
@@ -364,7 +407,7 @@ async def secure_chat(payload: ChatRequest, request: Request, pids_session: str 
     started = perf_counter()
     result = detector.detect(payload.prompt)
     request_id = f"req_{uuid4().hex[:12]}"
-    blocked = result.classification == "Malicious"
+    blocked = result.classification != "Safe"
 
     user_msg = {
         "id": f"msg_{uuid4().hex[:8]}",
@@ -374,28 +417,40 @@ async def secure_chat(payload: ChatRequest, request: Request, pids_session: str 
     }
     messages.append(user_msg)
 
-    if blocked and not is_admin and x_user_email:
-        REVOKED_USERS.add(normalized_email)
-        ADMIN_AUDIT.insert(0, {"action": "AUTO_BLOCK_MALICIOUS_PROMPT", "target_email": normalized_email, "request_id": request_id, "timestamp": datetime.now(timezone.utc).isoformat()})
-
     event = {
         "request_id": request_id,
         "chat_id": chat_id,
         "user_id": x_user_id,
         "user_email": x_user_email,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "prompt_classification": result.classification,
+        "prompt_classification": "Malicious" if blocked else "Safe",
         "confidence": result.confidence,
         "action": "BLOCKED" if blocked else "ALLOWED",
         "prompt_preview": " ".join(payload.prompt.split())[:180],
         "processing_latency_ms": round((perf_counter() - started) * 1000, 2),
-        "metadata": {"signals": result.matched_signals, "path": str(request.url.path)},
+        "metadata": {
+            "signals": result.matched_signals,
+            "path": str(request.url.path),
+            "detector_type": result.detector_type,
+            "model_version": result.model_version,
+            "malicious_probability": result.malicious_probability,
+        },
     }
     EVENTS.insert(0, event)
     if mongo_events is not None:
         await mongo_events.insert_one(event)
 
     if blocked:
+        if not is_admin:
+            REVOKED_USERS.add(normalized_email)
+            GRANTED_USERS.discard(normalized_email)
+            await set_user_access(normalized_email, "revoked", "malicious_prompt")
+            ADMIN_AUDIT.insert(0, {
+                "action": "AUTO_REVOKE_MALICIOUS_PROMPT",
+                "target_email": normalized_email,
+                "admin_email": None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
         assistant_msg = {
             "id": f"msg_{uuid4().hex[:8]}",
             "role": "assistant",
@@ -584,6 +639,7 @@ async def grant_user(email: str, x_user_role: str | None = Header(default=None),
     normalized_email = email.strip().lower()
     REVOKED_USERS.discard(normalized_email)
     GRANTED_USERS.add(normalized_email)
+    await set_user_access(normalized_email, "granted", "administrator_restore")
     ADMIN_AUDIT.insert(0, {"action": "GRANT_USER_ACCESS", "target_email": normalized_email, "admin_email": session.get("email"), "timestamp": datetime.now(timezone.utc).isoformat()})
     return {"status": "granted", "email": normalized_email}
 
@@ -598,6 +654,7 @@ async def revoke_user(email: str, x_user_role: str | None = Header(default=None)
         raise HTTPException(status_code=400, detail="Administrator access cannot be revoked")
     GRANTED_USERS.discard(normalized_email)
     REVOKED_USERS.add(normalized_email)
+    await set_user_access(normalized_email, "revoked", "administrator_action")
     ADMIN_AUDIT.insert(0, {"action": "REVOKE_USER_ACCESS", "target_email": normalized_email, "admin_email": session.get("email"), "timestamp": datetime.now(timezone.utc).isoformat()})
     return {"status": "revoked", "email": normalized_email}
 
@@ -611,12 +668,20 @@ class TrainPromptRequest(BaseModel):
 @app.get("/api/admin/detector/dataset")
 async def get_detector_dataset(x_user_role: str | None = Header(default=None), pids_session: str | None = Cookie(default=None)) -> dict:
     require_admin(x_user_role, pids_session)
+    status = detector_status()
     return {
-        "model_version": detector.model_version,
-        "accuracy": detector.accuracy,
-        "precision": detector.precision,
-        "recall": detector.recall,
-        "last_retrained": detector.last_retrained,
+        "detector_type": status["detector_type"],
+        "model_version": status["model_version"],
+        "dataset_version": status["dataset_version"],
+        "accuracy": status["accuracy"],
+        "precision": status["precision"],
+        "recall": status["recall"],
+        "f1": status["f1"],
+        "loss": status["loss"],
+        "malicious_threshold": status["malicious_threshold"],
+        "safe_threshold": status["safe_threshold"],
+        "max_length": status["max_length"],
+        "last_retrained": status["last_retrained"],
         "dataset": [
             {
                 "sample_id": s.sample_id,
@@ -626,7 +691,7 @@ async def get_detector_dataset(x_user_role: str | None = Header(default=None), p
                 "confidence": s.confidence,
                 "created_at": s.created_at,
             }
-            for s in detector.training_dataset
+            for s in status["training_dataset"]
         ]
     }
 
@@ -637,6 +702,11 @@ async def train_detector_prompt(body: TrainPromptRequest, x_user_role: str | Non
     if body.label not in ["Malicious", "Safe"]:
         raise HTTPException(status_code=400, detail="Label must be 'Malicious' or 'Safe'")
 
+    if not hasattr(detector, "train_prompt"):
+        raise HTTPException(
+            status_code=409,
+            detail="The active DistilBERT artifact is immutable. Save samples to a dataset before retraining.",
+        )
     sample = detector.train_prompt(body.prompt, body.label, body.category)
     ADMIN_AUDIT.insert(0, {
         "action": "TRAIN_PROMPT_DETECTOR",
@@ -651,6 +721,11 @@ async def train_detector_prompt(body: TrainPromptRequest, x_user_role: str | Non
 @app.post("/api/admin/detector/retrain")
 async def retrain_detector_model(x_user_role: str | None = Header(default=None), pids_session: str | None = Cookie(default=None)) -> dict:
     session = require_admin(x_user_role, pids_session)
+    if not hasattr(detector, "retrain_model"):
+        raise HTTPException(
+            status_code=409,
+            detail="DistilBERT retraining is performed by server/scripts/train_distilbert.py and is not an in-request operation.",
+        )
     res = detector.retrain_model()
     ADMIN_AUDIT.insert(0, {
         "action": "RETRAIN_DETECTOR_MODEL",
@@ -658,5 +733,3 @@ async def retrain_detector_model(x_user_role: str | None = Header(default=None),
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
     return res
-
-

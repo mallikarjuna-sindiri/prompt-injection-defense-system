@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import re
+from pathlib import Path
 from typing import Protocol, List, Dict
 from datetime import datetime, timezone
 
@@ -9,6 +10,9 @@ class DetectionResult:
     classification: str
     confidence: float | None
     matched_signals: List[str]
+    detector_type: str = "heuristic"
+    model_version: str | None = None
+    malicious_probability: float | None = None
 
 
 @dataclass
@@ -23,6 +27,140 @@ class TrainedPromptSample:
 
 class Detector(Protocol):
     def detect(self, prompt: str) -> DetectionResult: ...
+
+
+class DistilBertDetector:
+    """Loads a local Hugging Face sequence-classification artifact once."""
+
+    _obvious_safe_greeting = re.compile(
+        r"^(?:hi|hii|hiii|hello|hey|hey there|hello there|good morning|good afternoon|good evening)[!.?]?$",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, model_path: str, malicious_threshold: float = 0.8, safe_threshold: float = 0.2):
+        if not 0 <= safe_threshold < malicious_threshold <= 1:
+            raise ValueError("Detector thresholds must satisfy 0 <= safe < malicious <= 1")
+        model_dir = Path(model_path)
+        if not model_dir.is_dir():
+            raise FileNotFoundError(f"DistilBERT model directory does not exist: {model_dir}")
+        try:
+            from transformers import DistilBertForSequenceClassification, DistilBertTokenizerFast
+        except ImportError as exc:
+            raise RuntimeError("Install server/requirements-ml.txt to use the DistilBERT detector") from exc
+        import torch
+
+        self._torch = torch
+        self.tokenizer = DistilBertTokenizerFast.from_pretrained(str(model_dir))
+        self.model = DistilBertForSequenceClassification.from_pretrained(str(model_dir))
+        self.model.eval()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        self.malicious_threshold = malicious_threshold
+        self.safe_threshold = safe_threshold
+        manifest_path = model_dir.parent / "model_manifest.json"
+        self.model_version = model_dir.name
+        self.max_length = 256
+        self.metrics: dict[str, float] = {}
+        self.dataset_version: str | None = None
+        if manifest_path.is_file():
+            import json
+
+            manifest = json.loads(manifest_path.read_text())
+            self.model_version = str(manifest.get("model_version", self.model_version))
+            self.max_length = int(manifest.get("max_length", self.max_length))
+            self.metrics = {
+                key: float(value)
+                for key, value in manifest.get("metrics", {}).items()
+                if isinstance(value, (int, float))
+            }
+            self.dataset_version = manifest.get("dataset_version")
+        self.last_retrained = manifest_path.stat().st_mtime if manifest_path.is_file() else None
+        self.training_dataset: list[TrainedPromptSample] = []
+
+    def detect(self, prompt: str) -> DetectionResult:
+        if self._obvious_safe_greeting.fullmatch(prompt.strip()):
+            return DetectionResult(
+                "Safe",
+                0.99,
+                [],
+                detector_type="distilbert",
+                model_version=self.model_version,
+                malicious_probability=0.0,
+            )
+        encoded = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.max_length)
+        encoded = {key: value.to(self.device) for key, value in encoded.items()}
+        with self._torch.inference_mode():
+            probabilities = self._torch.softmax(self.model(**encoded).logits, dim=-1)[0]
+        malicious_probability = float(probabilities[1].item())
+        if malicious_probability >= self.malicious_threshold:
+            classification = "Malicious"
+            confidence = malicious_probability
+        elif malicious_probability <= self.safe_threshold:
+            classification = "Safe"
+            confidence = 1 - malicious_probability
+        else:
+            classification = "Uncertain"
+            confidence = max(malicious_probability, 1 - malicious_probability)
+        return DetectionResult(
+            classification,
+            confidence,
+            ["distilbert_malicious"] if classification == "Malicious" else [],
+            detector_type="distilbert",
+            model_version=self.model_version,
+            malicious_probability=malicious_probability,
+        )
+
+    def status(self) -> dict:
+        return {
+            "detector_type": "distilbert",
+            "model_version": self.model_version,
+            "dataset_version": self.dataset_version,
+            "accuracy": self.metrics.get("eval_accuracy", 0) * 100,
+            "precision": self.metrics.get("eval_precision", 0) * 100,
+            "recall": self.metrics.get("eval_recall", 0) * 100,
+            "f1": self.metrics.get("eval_f1", 0) * 100,
+            "loss": self.metrics.get("eval_loss"),
+            "malicious_threshold": self.malicious_threshold,
+            "safe_threshold": self.safe_threshold,
+            "max_length": self.max_length,
+            "last_retrained": (
+                datetime.fromtimestamp(self.last_retrained, timezone.utc).isoformat()
+                if self.last_retrained is not None
+                else None
+            ),
+            "training_dataset": self.training_dataset,
+        }
+
+
+class HybridDetector:
+    def __init__(self, heuristic: "HeuristicDetector", model: DistilBertDetector):
+        self.heuristic = heuristic
+        self.model = model
+
+    def detect(self, prompt: str) -> DetectionResult:
+        heuristic_result = self.heuristic.detect(prompt)
+        model_result = self.model.detect(prompt)
+        if heuristic_result.classification == "Malicious" or model_result.classification == "Malicious":
+            classification = "Malicious"
+        elif model_result.classification == "Uncertain":
+            classification = "Malicious"
+        else:
+            classification = "Safe"
+        return DetectionResult(
+            classification,
+            max(heuristic_result.confidence or 0, model_result.confidence or 0),
+            heuristic_result.matched_signals + model_result.matched_signals + (
+                ["distilbert_uncertain"] if model_result.classification == "Uncertain" else []
+            ),
+            detector_type="hybrid",
+            model_version=model_result.model_version,
+            malicious_probability=model_result.malicious_probability,
+        )
+
+    def status(self) -> dict:
+        status = self.model.status()
+        status["detector_type"] = "hybrid"
+        return status
 
 
 class HeuristicDetector:
@@ -70,6 +208,23 @@ class HeuristicDetector:
         self.accuracy: float = 99.2
         self.precision: float = 98.9
         self.recall: float = 99.5
+
+    def status(self) -> dict:
+        return {
+            "detector_type": "heuristic",
+            "model_version": self.model_version,
+            "dataset_version": None,
+            "accuracy": self.accuracy / 100,
+            "precision": self.precision / 100,
+            "recall": self.recall / 100,
+            "f1": None,
+            "loss": None,
+            "malicious_threshold": None,
+            "safe_threshold": None,
+            "max_length": None,
+            "last_retrained": self.last_retrained,
+            "training_dataset": self.training_dataset,
+        }
 
     def detect(self, prompt: str) -> DetectionResult:
         matched = [name for name, pattern in self.signals.items() if pattern.search(prompt)]
