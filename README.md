@@ -7,7 +7,8 @@ reach the model, and records the result for security operations and audit
 visibility.
 
 This repository contains the current working prototype: a FastAPI security
-gateway, a Next.js security console, an optional MongoDB persistence layer, and
+gateway, a Next.js security console, durable SQLite persistence, optional MongoDB
+replication, and
 an optional Google Gemini or custom LLM provider.
 
 > **Important:** The gateway supports heuristic, DistilBERT, and hybrid
@@ -57,12 +58,30 @@ FastAPI PIDS gateway
        +--> Event and conversation persistence
        |
        v
-MongoDB or in-memory demo fallback
+SQLite database (optional MongoDB replication)
 ```
 
 The security boundary is the FastAPI gateway. The browser never calls the
 target LLM directly. A blocked prompt receives a security response and is not
 forwarded to Gemini or `TARGET_LLM_URL`.
+
+For company integrations, the gateway can also be used as a tenant-aware API:
+
+```text
+Company application
+       |
+       v
+POST /v1/{company_id}/chat
+       |
+       +--> Company API key authentication
+       +--> Prompt detection and policy decision
+       +--> Configured target LLM provider
+       +--> Company-scoped telemetry
+```
+
+Company API traffic is tagged with `company_id`. Platform administrator event
+responses expose operational metadata for this traffic but redact the prompt
+preview, preserving company content privacy.
 
 ## Architecture
 
@@ -103,15 +122,19 @@ contract or dashboard integration.
 
 ### Persistence
 
-When `MONGODB_URI` is configured and MongoDB responds to the startup ping:
+Security events and chat conversations are always stored in the SQLite database
+at `server/data/pids.sqlite3` by default (or the path in `SQLITE_DB_PATH`).
+Detector training samples and retraining metadata are stored in the same
+database, so the Detector Performance page remains dynamic after restarts.
+When `MONGODB_URI` is configured and MongoDB responds to the startup ping, the
+same records are also replicated there:
 
 - Security events are stored in the `security_events` collection.
 - Chat conversations are stored in the `chat_conversations` collection.
 - Dynamic admin email records are read from the `admin_roles` collection.
 
-If MongoDB is unavailable, the server falls back to process memory for events
-and conversations. This is useful for demonstrations but is not durable and is
-lost when the server restarts.
+If MongoDB is unavailable, SQLite remains the source used by the dashboard and
+the data remains available after restarts.
 
 ## How a prompt is processed
 
@@ -175,6 +198,33 @@ also clears the automatic lockout.
 - Request IDs and confidence values.
 - Example safe-prompt and injection-prompt generators in the UI.
 - Request pipeline visualization.
+
+### Company middleware API
+
+The company integration endpoint is:
+
+```http
+POST /v1/{company_id}/chat
+Authorization: Bearer <company-api-key>
+Content-Type: application/json
+
+{"prompt": "your end-user prompt"}
+```
+
+The key must be configured for the same `company_id` as the URL. Safe prompts
+are forwarded to the configured provider and malicious prompts stop at the
+gateway. Each company event is tagged with `source=company_api`; platform
+admin event responses remove its `prompt_preview`.
+
+For local development, configure:
+
+```env
+COMPANY_API_KEYS=acme=replace-with-a-long-random-company-key
+```
+
+Do not use plain environment values as a long-term key-management strategy.
+Production deployments should store hashed keys in a secrets manager or
+database, support rotation, expiration, scopes, quotas, and audit history.
 
 ### Security operations console
 
@@ -267,7 +317,8 @@ cp server/.env.example server/.env
 
 | Variable | Required | Description |
 |---|---:|---|
-| `MONGODB_URI` | No | MongoDB connection string. Enables durable persistence when reachable. |
+| `SQLITE_DB_PATH` | No | Local SQLite database path. Defaults to `server/data/pids.sqlite3`. |
+| `MONGODB_URI` | No | Optional MongoDB connection string for record replication. |
 | `MONGODB_DB` | No | Database name. Defaults to `pids`. |
 | `JWT_SECRET` | Yes outside demo | Secret used to sign and validate sessions. Use a long random value. |
 | `GOOGLE_CLIENT_ID` | For OAuth | Google OAuth client ID. |
@@ -302,7 +353,7 @@ Do not commit real credentials. `server/.env` is ignored by Git; use
 - Python 3.12 or a compatible Python 3 version supported by the project.
 - Node.js 22 or compatible modern Node.js.
 - npm.
-- MongoDB, if durable persistence is required.
+- MongoDB, only if replication is required; SQLite is included for local persistence.
 
 ### Start the backend
 

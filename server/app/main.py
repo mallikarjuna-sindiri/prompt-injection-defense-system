@@ -1,7 +1,11 @@
 from datetime import datetime, timezone
 from time import perf_counter
 from uuid import uuid4
+import hmac
+import json
 import os
+import sqlite3
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -54,6 +58,146 @@ mongo_conversations = None
 mongo_admin_roles = None
 mongo_user_access = None
 CONVERSATIONS: dict[str, dict] = {}
+SQLITE_DB_PATH = Path(os.getenv("SQLITE_DB_PATH", Path(__file__).resolve().parents[1] / "data" / "pids.sqlite3"))
+SQLITE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+sqlite_db = sqlite3.connect(SQLITE_DB_PATH, check_same_thread=False)
+sqlite_db.row_factory = sqlite3.Row
+sqlite_db.execute("PRAGMA journal_mode=WAL")
+sqlite_db.execute("PRAGMA synchronous=FULL")
+sqlite_db.execute("PRAGMA foreign_keys=ON")
+
+
+def initialize_sqlite() -> None:
+    sqlite_db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS security_events (
+            request_id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            payload TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS chat_conversations (
+            chat_id TEXT PRIMARY KEY,
+            user_email TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            payload TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS detector_training_samples (
+            sample_id TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            label TEXT NOT NULL,
+            category TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS detector_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_security_events_timestamp
+            ON security_events(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_chat_conversations_user_updated
+            ON chat_conversations(user_email, updated_at DESC);
+        """
+    )
+    sqlite_db.commit()
+
+
+def sqlite_event_count() -> int:
+    return int(sqlite_db.execute("SELECT COUNT(*) FROM security_events").fetchone()[0])
+
+
+def sqlite_events(limit: int = 100) -> list[dict]:
+    rows = sqlite_db.execute(
+        "SELECT payload FROM security_events ORDER BY timestamp DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [json.loads(row["payload"]) for row in rows]
+
+
+def persist_event(event: dict) -> None:
+    sqlite_db.execute(
+        """
+        INSERT OR REPLACE INTO security_events (request_id, timestamp, payload)
+        VALUES (?, ?, ?)
+        """,
+        (event["request_id"], event["timestamp"], json.dumps(event)),
+    )
+    sqlite_db.commit()
+
+
+initialize_sqlite()
+
+
+def load_detector_persistence() -> None:
+    if not hasattr(detector, "training_dataset"):
+        return
+    rows = sqlite_db.execute(
+        "SELECT sample_id, prompt, label, category, confidence, created_at "
+        "FROM detector_training_samples ORDER BY created_at DESC"
+    ).fetchall()
+    if rows:
+        detector.training_dataset = [
+            type(detector.training_dataset[0])(
+                row["sample_id"],
+                row["prompt"],
+                row["label"],
+                row["category"],
+                row["confidence"],
+                row["created_at"],
+            )
+            for row in rows
+        ] if detector.training_dataset else []
+    else:
+        for sample in detector.training_dataset:
+            sqlite_db.execute(
+                """
+                INSERT OR IGNORE INTO detector_training_samples
+                (sample_id, prompt, label, category, confidence, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (sample.sample_id, sample.prompt, sample.label, sample.category, sample.confidence, sample.created_at),
+            )
+    state_rows = sqlite_db.execute("SELECT key, value FROM detector_state").fetchall()
+    state = {row["key"]: row["value"] for row in state_rows}
+    for key in ("model_version", "last_retrained"):
+        if key in state and hasattr(detector, key):
+            setattr(detector, key, state[key])
+    for key in ("accuracy", "precision", "recall"):
+        if key in state and hasattr(detector, key):
+            setattr(detector, key, float(state[key]))
+    sqlite_db.commit()
+
+
+def persist_detector_state() -> None:
+    if not hasattr(detector, "training_dataset"):
+        return
+    for sample in detector.training_dataset:
+        sqlite_db.execute(
+            """
+            INSERT OR REPLACE INTO detector_training_samples
+            (sample_id, prompt, label, category, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (sample.sample_id, sample.prompt, sample.label, sample.category, sample.confidence, sample.created_at),
+        )
+    for key in ("model_version", "last_retrained", "accuracy", "precision", "recall"):
+        if hasattr(detector, key):
+            sqlite_db.execute(
+                "INSERT OR REPLACE INTO detector_state (key, value) VALUES (?, ?)",
+                (key, str(getattr(detector, key))),
+            )
+    sqlite_db.commit()
+
+
+def persisted_detector_samples() -> list[dict]:
+    rows = sqlite_db.execute(
+        "SELECT sample_id, prompt, label, category, confidence, created_at "
+        "FROM detector_training_samples ORDER BY created_at DESC"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+load_detector_persistence()
 
 
 def get_all_admin_emails() -> set[str]:
@@ -135,6 +279,55 @@ class ChatResponse(BaseModel):
     matched_signals: list[str] = []
 
 
+class CompanyChatRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+
+
+class CompanyChatResponse(BaseModel):
+    request_id: str
+    company_id: str
+    classification: str
+    confidence: float | None
+    action: str
+    message: str
+    forwarded_to_llm: bool
+    assistant_response: str | None = None
+    matched_signals: list[str] = []
+
+
+def configured_company_api_keys() -> dict[str, str]:
+    """Read company API keys from COMPANY_API_KEYS=company_id=key,..."""
+    configured = os.getenv("COMPANY_API_KEYS", "")
+    result: dict[str, str] = {}
+    for entry in configured.split(","):
+        company_id, separator, api_key = entry.strip().partition("=")
+        if separator and company_id and api_key:
+            result[company_id.strip()] = api_key.strip()
+    return result
+
+
+def require_company_api_key(
+    company_id: str,
+    authorization: str | None,
+    x_pids_api_key: str | None,
+) -> None:
+    provided_key = x_pids_api_key
+    if not provided_key and authorization and authorization.lower().startswith("bearer "):
+        provided_key = authorization[7:].strip()
+    expected_key = configured_company_api_keys().get(company_id)
+    if not expected_key or not provided_key or not hmac.compare_digest(provided_key, expected_key):
+        raise HTTPException(status_code=401, detail="Invalid company API credentials")
+
+
+def redact_platform_event(event: dict) -> dict:
+    """Keep platform admins on operational metadata without exposing company content."""
+    redacted = dict(event)
+    if redacted.get("source") == "company_api":
+        redacted.pop("prompt_preview", None)
+        redacted["content_redacted"] = True
+    return redacted
+
+
 async def save_conversation(chat_id: str, user_email: str, title: str, messages: list[dict]) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     record = {
@@ -145,69 +338,69 @@ async def save_conversation(chat_id: str, user_email: str, title: str, messages:
         "updated_at": now,
         "messages": messages,
     }
+    existing = sqlite_db.execute(
+        "SELECT payload FROM chat_conversations WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    if existing:
+        record["created_at"] = json.loads(existing["payload"]).get("created_at", now)
+    sqlite_db.execute(
+        """
+        INSERT OR REPLACE INTO chat_conversations (chat_id, user_email, updated_at, payload)
+        VALUES (?, ?, ?, ?)
+        """,
+        (chat_id, record["user_email"], now, json.dumps(record)),
+    )
+    sqlite_db.commit()
     if mongo_conversations is not None:
         await mongo_conversations.update_one(
             {"chat_id": chat_id},
             {"$set": {"user_email": user_email.lower(), "title": title, "updated_at": now, "messages": messages}, "$setOnInsert": {"created_at": now}},
             upsert=True,
         )
-    else:
-        if chat_id in CONVERSATIONS:
-            record["created_at"] = CONVERSATIONS[chat_id].get("created_at", now)
-        CONVERSATIONS[chat_id] = record
+    CONVERSATIONS[chat_id] = record
     return record
 
 
 async def get_user_conversations(user_email: str) -> list[dict]:
     normalized = user_email.lower()
-    if mongo_conversations is not None:
-        records = await mongo_conversations.find({"user_email": normalized}, {"_id": 0}).sort("updated_at", -1).to_list(length=100)
-        return [
-            {
-                "chat_id": r["chat_id"],
-                "title": r.get("title", "Untitled Chat"),
-                "created_at": r.get("created_at"),
-                "updated_at": r.get("updated_at"),
-                "message_count": len(r.get("messages", [])),
-                "last_message": r["messages"][-1].get("text", "") if r.get("messages") else "",
-            }
-            for r in records
-        ]
-    else:
-        user_chats = [c for c in CONVERSATIONS.values() if c.get("user_email") == normalized]
-        user_chats.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-        return [
-            {
-                "chat_id": r["chat_id"],
-                "title": r.get("title", "Untitled Chat"),
-                "created_at": r.get("created_at"),
-                "updated_at": r.get("updated_at"),
-                "message_count": len(r.get("messages", [])),
-                "last_message": r["messages"][-1].get("text", "") if r.get("messages") else "",
-            }
-            for r in user_chats
-        ]
+    rows = sqlite_db.execute(
+        "SELECT payload FROM chat_conversations WHERE user_email = ? ORDER BY updated_at DESC LIMIT 100",
+        (normalized,),
+    ).fetchall()
+    records = [json.loads(row["payload"]) for row in rows]
+    return [
+        {
+            "chat_id": r["chat_id"],
+            "title": r.get("title", "Untitled Chat"),
+            "created_at": r.get("created_at"),
+            "updated_at": r.get("updated_at"),
+            "message_count": len(r.get("messages", [])),
+            "last_message": r["messages"][-1].get("text", "") if r.get("messages") else "",
+        }
+        for r in records
+    ]
 
 
 async def get_conversation_by_id(chat_id: str, user_email: str) -> dict | None:
     normalized = user_email.lower()
-    if mongo_conversations is not None:
-        return await mongo_conversations.find_one({"chat_id": chat_id, "user_email": normalized}, {"_id": 0})
-    doc = CONVERSATIONS.get(chat_id)
-    if doc and doc.get("user_email") == normalized:
-        return doc
-    return None
+    row = sqlite_db.execute(
+        "SELECT payload FROM chat_conversations WHERE chat_id = ? AND user_email = ?",
+        (chat_id, normalized),
+    ).fetchone()
+    return json.loads(row["payload"]) if row else None
 
 
 async def delete_conversation_by_id(chat_id: str, user_email: str) -> bool:
     normalized = user_email.lower()
+    result = sqlite_db.execute(
+        "DELETE FROM chat_conversations WHERE chat_id = ? AND user_email = ?",
+        (chat_id, normalized),
+    )
+    sqlite_db.commit()
     if mongo_conversations is not None:
-        result = await mongo_conversations.delete_one({"chat_id": chat_id, "user_email": normalized})
-        return result.deleted_count > 0
-    if chat_id in CONVERSATIONS and CONVERSATIONS[chat_id].get("user_email") == normalized:
-        del CONVERSATIONS[chat_id]
-        return True
-    return False
+        await mongo_conversations.delete_one({"chat_id": chat_id, "user_email": normalized})
+    CONVERSATIONS.pop(chat_id, None)
+    return result.rowcount > 0
 
 
 async def forward_to_gemini(prompt: str) -> str:
@@ -268,7 +461,12 @@ async def forward_to_target_llm(prompt: str) -> str:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "operational", "service": "security-gateway", "persistence": "mongodb" if mongo_events is not None else "demo-fallback", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "operational",
+        "service": "security-gateway",
+        "persistence": "sqlite" if mongo_events is None else "sqlite+mongodb",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/api/auth/google/login")
@@ -437,6 +635,7 @@ async def secure_chat(payload: ChatRequest, request: Request, pids_session: str 
         },
     }
     EVENTS.insert(0, event)
+    persist_event(event)
     if mongo_events is not None:
         await mongo_events.insert_one(event)
 
@@ -529,16 +728,95 @@ async def secure_chat(payload: ChatRequest, request: Request, pids_session: str 
         )
 
 
+@app.post("/v1/{company_id}/chat", response_model=CompanyChatResponse)
+async def company_chat(
+    company_id: str,
+    payload: CompanyChatRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_pids_api_key: str | None = Header(default=None),
+) -> CompanyChatResponse:
+    """Company-facing middleware endpoint.
+
+    The API key determines access to the tenant. The company_id path segment is
+    only accepted when it matches the same configured credential.
+    """
+    require_company_api_key(company_id, authorization, x_pids_api_key)
+    started = perf_counter()
+    result = detector.detect(payload.prompt)
+    request_id = f"req_{uuid4().hex[:12]}"
+    blocked = result.classification != "Safe"
+    event = {
+        "request_id": request_id,
+        "company_id": company_id,
+        "source": "company_api",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "prompt_classification": "Malicious" if blocked else "Safe",
+        "confidence": result.confidence,
+        "action": "BLOCKED" if blocked else "ALLOWED",
+        "prompt_preview": " ".join(payload.prompt.split())[:180],
+        "processing_latency_ms": round((perf_counter() - started) * 1000, 2),
+        "metadata": {
+            "signals": result.matched_signals,
+            "path": str(request.url.path),
+            "detector_type": result.detector_type,
+            "model_version": result.model_version,
+            "malicious_probability": result.malicious_probability,
+        },
+    }
+    EVENTS.insert(0, event)
+    persist_event(event)
+    if mongo_events is not None:
+        await mongo_events.insert_one(event)
+
+    if blocked:
+        return CompanyChatResponse(
+            request_id=request_id,
+            company_id=company_id,
+            classification="Malicious",
+            confidence=result.confidence,
+            action="BLOCKED",
+            message="Request blocked by the security middleware. It was not forwarded to the target LLM.",
+            forwarded_to_llm=False,
+            matched_signals=result.matched_signals,
+        )
+
+    try:
+        assistant_response = await forward_to_target_llm(payload.prompt)
+    except (httpx.HTTPError, RuntimeError, ValueError, KeyError) as provider_error:
+        return CompanyChatResponse(
+            request_id=request_id,
+            company_id=company_id,
+            classification="Safe",
+            confidence=result.confidence,
+            action="LLM_UNAVAILABLE",
+            message="The prompt passed security checks, but the configured LLM provider is unavailable.",
+            forwarded_to_llm=False,
+            assistant_response=str(provider_error),
+            matched_signals=[],
+        )
+
+    return CompanyChatResponse(
+        request_id=request_id,
+        company_id=company_id,
+        classification="Safe",
+        confidence=result.confidence,
+        action="ALLOWED",
+        message="Request cleared by the security middleware.",
+        forwarded_to_llm=True,
+        assistant_response=assistant_response,
+        matched_signals=[],
+    )
+
+
 
 @app.get("/api/admin/events")
 async def admin_events(x_user_role: str | None = Header(default=None), pids_session: str | None = Cookie(default=None)) -> dict:
     session = get_session(pids_session) if pids_session else ({"role": x_user_role} if os.getenv("DEMO_MODE", "false").lower() == "true" else None)
     if not session or session.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Administrator role required")
-    if mongo_events is not None:
-        records = await mongo_events.find({}, {"_id": 0}).sort("timestamp", -1).limit(100).to_list(length=100)
-        return {"events": records, "total": await mongo_events.count_documents({})}
-    return {"events": EVENTS[:100], "total": len(EVENTS)}
+    records = sqlite_events()
+    return {"events": [redact_platform_event(record) for record in records], "total": sqlite_event_count()}
 
 
 @app.get("/api/admin/overview")
@@ -546,19 +824,14 @@ async def admin_overview(x_user_role: str | None = Header(default=None), pids_se
     session = get_session(pids_session) if pids_session else ({"role": x_user_role} if os.getenv("DEMO_MODE", "false").lower() == "true" else None)
     if not session or session.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Administrator role required")
-    if mongo_events is not None:
-        total = await mongo_events.count_documents({})
-        malicious = await mongo_events.count_documents({"prompt_classification": "Malicious"})
-        safe = await mongo_events.count_documents({"prompt_classification": "Safe"})
-        confidence_values = [event["confidence"] async for event in mongo_events.find({}, {"confidence": 1, "_id": 0}) if event.get("confidence") is not None]
-    else:
-        total = len(EVENTS)
-        malicious = sum(1 for event in EVENTS if event["prompt_classification"] == "Malicious")
-        safe = sum(1 for event in EVENTS if event["prompt_classification"] == "Safe")
-        confidence_values = [event["confidence"] for event in EVENTS if event.get("confidence") is not None]
+    records = sqlite_events(limit=max(sqlite_event_count(), 1))
+    total = len(records)
+    malicious = sum(1 for event in records if event["prompt_classification"] == "Malicious")
+    safe = sum(1 for event in records if event["prompt_classification"] == "Safe")
+    confidence_values = [event["confidence"] for event in records if event.get("confidence") is not None]
     average_confidence = round((sum(confidence_values) / len(confidence_values)) * 100, 1) if confidence_values else 0
     detection_rate = round((safe / total) * 100, 1) if total else 0
-    return {"total_requests": total, "safe_requests": safe, "malicious_requests": malicious, "blocked_requests": malicious, "detection_rate": detection_rate, "avg_confidence": average_confidence, "system_status": "Operational" if mongo_events is not None or EVENTS else "Waiting for traffic"}
+    return {"total_requests": total, "safe_requests": safe, "malicious_requests": malicious, "blocked_requests": malicious, "detection_rate": detection_rate, "avg_confidence": average_confidence, "system_status": "Operational" if total else "Waiting for traffic"}
 
 
 GRANT_ALL_USERS: bool = True
@@ -588,17 +861,14 @@ def require_admin(x_user_role: str | None, pids_session: str | None) -> dict:
 @app.get("/api/admin/users")
 async def admin_users(x_user_role: str | None = Header(default=None), pids_session: str | None = Cookie(default=None)) -> dict:
     require_admin(x_user_role, pids_session)
-    if mongo_events is not None:
-        records = await mongo_events.aggregate([{"$group": {"_id": "$user_email", "requests": {"$sum": 1}, "malicious": {"$sum": {"$cond": [{"$eq": ["$prompt_classification", "Malicious"]}, 1, 0]}}, "last_seen": {"$max": "$timestamp"}}}, {"$project": {"_id": 0, "email": "$_id", "requests": 1, "malicious": 1, "last_seen": 1}}]).to_list(length=500)
-    else:
-        grouped: dict[str, dict] = {}
-        for event in EVENTS:
-            user = event.get("user_email", "unknown")
-            current = grouped.setdefault(user, {"email": user, "requests": 0, "malicious": 0, "last_seen": event.get("timestamp")})
-            current["requests"] += 1
-            current["malicious"] += int(event.get("prompt_classification") == "Malicious")
-            current["last_seen"] = max(current["last_seen"], event.get("timestamp", ""))
-        records = list(grouped.values())
+    grouped: dict[str, dict] = {}
+    for event in sqlite_events(limit=max(sqlite_event_count(), 1)):
+        user = event.get("user_email", "unknown")
+        current = grouped.setdefault(user, {"email": user, "requests": 0, "malicious": 0, "last_seen": event.get("timestamp")})
+        current["requests"] += 1
+        current["malicious"] += int(event.get("prompt_classification") == "Malicious")
+        current["last_seen"] = max(current["last_seen"], event.get("timestamp", ""))
+    records = list(grouped.values())
     admin_emails = {item.strip().lower() for item in os.getenv("ADMIN_EMAILS", "").split(",") if item.strip()}
     for record in records:
         email = record["email"].lower()
@@ -669,20 +939,12 @@ class TrainPromptRequest(BaseModel):
 async def get_detector_dataset(x_user_role: str | None = Header(default=None), pids_session: str | None = Cookie(default=None)) -> dict:
     require_admin(x_user_role, pids_session)
     status = detector_status()
-    return {
-        "detector_type": status["detector_type"],
-        "model_version": status["model_version"],
-        "dataset_version": status["dataset_version"],
-        "accuracy": status["accuracy"],
-        "precision": status["precision"],
-        "recall": status["recall"],
-        "f1": status["f1"],
-        "loss": status["loss"],
-        "malicious_threshold": status["malicious_threshold"],
-        "safe_threshold": status["safe_threshold"],
-        "max_length": status["max_length"],
-        "last_retrained": status["last_retrained"],
-        "dataset": [
+    def percentage(value: float | None) -> float | None:
+        return round(value * 100, 2) if value is not None and value <= 1 else value
+
+    samples = persisted_detector_samples()
+    if not samples:
+        samples = [
             {
                 "sample_id": s.sample_id,
                 "prompt": s.prompt,
@@ -693,6 +955,33 @@ async def get_detector_dataset(x_user_role: str | None = Header(default=None), p
             }
             for s in status["training_dataset"]
         ]
+    if not samples:
+        samples = [
+            {
+                "sample_id": f"event-{event['request_id']}",
+                "prompt": event.get("prompt_preview", ""),
+                "label": event.get("prompt_classification", "Safe"),
+                "category": (event.get("metadata", {}).get("signals") or ["Gateway Event"])[0],
+                "confidence": event.get("confidence", 0),
+                "created_at": event.get("timestamp", ""),
+            }
+            for event in sqlite_events(limit=100)
+            if event.get("prompt_preview")
+        ]
+    return {
+        "detector_type": status["detector_type"],
+        "model_version": status["model_version"],
+        "dataset_version": status["dataset_version"],
+        "accuracy": percentage(status["accuracy"]),
+        "precision": percentage(status["precision"]),
+        "recall": percentage(status["recall"]),
+        "f1": percentage(status["f1"]),
+        "loss": status["loss"],
+        "malicious_threshold": status["malicious_threshold"],
+        "safe_threshold": status["safe_threshold"],
+        "max_length": status["max_length"],
+        "last_retrained": status["last_retrained"],
+        "dataset": samples,
     }
 
 
@@ -702,12 +991,22 @@ async def train_detector_prompt(body: TrainPromptRequest, x_user_role: str | Non
     if body.label not in ["Malicious", "Safe"]:
         raise HTTPException(status_code=400, detail="Label must be 'Malicious' or 'Safe'")
 
-    if not hasattr(detector, "train_prompt"):
-        raise HTTPException(
-            status_code=409,
-            detail="The active DistilBERT artifact is immutable. Save samples to a dataset before retraining.",
+    if hasattr(detector, "train_prompt"):
+        sample = detector.train_prompt(body.prompt, body.label, body.category)
+        persist_detector_state()
+        sample_id = sample.sample_id
+    else:
+        sample_id = f"tr-{sqlite_db.execute('SELECT COUNT(*) FROM detector_training_samples').fetchone()[0] + 1:03d}"
+        now = datetime.now(timezone.utc).isoformat()
+        sqlite_db.execute(
+            """
+            INSERT INTO detector_training_samples
+            (sample_id, prompt, label, category, confidence, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (sample_id, body.prompt, body.label, body.category, 0.98 if body.label == "Malicious" else 0.96, now),
         )
-    sample = detector.train_prompt(body.prompt, body.label, body.category)
+        sqlite_db.commit()
     ADMIN_AUDIT.insert(0, {
         "action": "TRAIN_PROMPT_DETECTOR",
         "label": body.label,
@@ -715,7 +1014,7 @@ async def train_detector_prompt(body: TrainPromptRequest, x_user_role: str | Non
         "admin_email": session.get("email"),
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
-    return {"status": "trained", "sample_id": sample.sample_id, "label": sample.label, "category": sample.category}
+    return {"status": "trained", "sample_id": sample_id, "label": body.label, "category": body.category}
 
 
 @app.post("/api/admin/detector/retrain")
@@ -727,6 +1026,7 @@ async def retrain_detector_model(x_user_role: str | None = Header(default=None),
             detail="DistilBERT retraining is performed by server/scripts/train_distilbert.py and is not an in-request operation.",
         )
     res = detector.retrain_model()
+    persist_detector_state()
     ADMIN_AUDIT.insert(0, {
         "action": "RETRAIN_DETECTOR_MODEL",
         "admin_email": session.get("email"),

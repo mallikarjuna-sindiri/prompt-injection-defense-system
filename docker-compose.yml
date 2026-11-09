@@ -12,6 +12,8 @@ services:
     env_file: ./server/.env
     ports:
       - "8000:8000"
+    volumes:
+      - ./server/data:/app/data
     depends_on:
       - mongo
   client:
