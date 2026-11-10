@@ -93,6 +93,14 @@ def initialize_sqlite() -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            email TEXT PRIMARY KEY,
+            company_name TEXT NOT NULL,
+            username TEXT NOT NULL,
+            logo_data TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_security_events_timestamp
             ON security_events(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_chat_conversations_user_updated
@@ -112,6 +120,12 @@ def sqlite_events(limit: int = 100) -> list[dict]:
         (limit,),
     ).fetchall()
     return [json.loads(row["payload"]) for row in rows]
+
+
+def sqlite_user_events(email: str, limit: int = 100) -> list[dict]:
+    records = sqlite_events(limit=max(sqlite_event_count(), 1))
+    normalized = email.strip().lower()
+    return [record for record in records if record.get("user_email", "").lower() == normalized][:limit]
 
 
 def persist_event(event: dict) -> None:
@@ -293,6 +307,45 @@ class CompanyChatResponse(BaseModel):
     forwarded_to_llm: bool
     assistant_response: str | None = None
     matched_signals: list[str] = []
+
+
+class UserProfileRequest(BaseModel):
+    company_name: str = Field(min_length=1, max_length=120)
+    username: str = Field(min_length=1, max_length=80)
+    logo_data: str | None = Field(default=None, max_length=2_000_000)
+
+
+def get_user_profile(email: str) -> dict | None:
+    row = sqlite_db.execute(
+        "SELECT email, company_name, username, logo_data, created_at, updated_at "
+        "FROM user_profiles WHERE email = ?",
+        (email.strip().lower(),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def save_user_profile(email: str, profile: UserProfileRequest) -> dict:
+    normalized_email = email.strip().lower()
+    now = datetime.now(timezone.utc).isoformat()
+    existing = get_user_profile(normalized_email)
+    created_at = existing["created_at"] if existing else now
+    sqlite_db.execute(
+        """
+        INSERT OR REPLACE INTO user_profiles
+        (email, company_name, username, logo_data, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            normalized_email,
+            profile.company_name.strip(),
+            profile.username.strip(),
+            profile.logo_data,
+            created_at,
+            now,
+        ),
+    )
+    sqlite_db.commit()
+    return get_user_profile(normalized_email) or {}
 
 
 def configured_company_api_keys() -> dict[str, str]:
@@ -533,7 +586,43 @@ async def auth_me(pids_session: str | None = Cookie(default=None)) -> dict:
             is_revoked = True
     result = dict(session)
     result["status"] = "revoked" if is_revoked else "active"
+    profile = get_user_profile(email)
+    result["profile_completed"] = profile is not None
+    result["profile"] = profile
     return result
+
+
+@app.get("/api/auth/profile")
+async def auth_profile(pids_session: str | None = Cookie(default=None)) -> dict:
+    session = get_session(pids_session)
+    profile = get_user_profile(session["email"])
+    return {"profile_completed": profile is not None, "profile": profile}
+
+
+@app.put("/api/auth/profile")
+async def update_auth_profile(
+    payload: UserProfileRequest,
+    pids_session: str | None = Cookie(default=None),
+) -> dict:
+    session = get_session(pids_session)
+    profile = save_user_profile(session["email"], payload)
+    return {"profile_completed": True, "profile": profile}
+
+
+@app.get("/api/user/monitoring")
+async def user_monitoring(pids_session: str | None = Cookie(default=None)) -> dict:
+    session = get_session(pids_session)
+    records = sqlite_user_events(session["email"])
+    malicious = sum(event.get("prompt_classification") == "Malicious" for event in records)
+    safe = sum(event.get("prompt_classification") == "Safe" for event in records)
+    return {
+        "total_requests": len(records),
+        "safe_requests": safe,
+        "malicious_requests": malicious,
+        "blocked_requests": malicious,
+        "detection_rate": round((safe / len(records)) * 100, 1) if records else 0,
+        "events": [redact_platform_event(record) for record in records],
+    }
 
 
 @app.get("/api/auth/logout")

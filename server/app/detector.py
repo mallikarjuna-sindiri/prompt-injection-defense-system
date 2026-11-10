@@ -76,6 +76,7 @@ class DistilBertDetector:
             self.dataset_version = manifest.get("dataset_version")
         self.last_retrained = manifest_path.stat().st_mtime if manifest_path.is_file() else None
         self.training_dataset: list[TrainedPromptSample] = []
+        self.heuristic = HeuristicDetector()
 
     def detect(self, prompt: str) -> DetectionResult:
         if self._obvious_safe_greeting.fullmatch(prompt.strip()):
@@ -87,24 +88,28 @@ class DistilBertDetector:
                 model_version=self.model_version,
                 malicious_probability=0.0,
             )
+        heuristic_result = self.heuristic.detect(prompt)
         encoded = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.max_length)
         encoded = {key: value.to(self.device) for key, value in encoded.items()}
         with self._torch.inference_mode():
             probabilities = self._torch.softmax(self.model(**encoded).logits, dim=-1)[0]
         malicious_probability = float(probabilities[1].item())
-        if malicious_probability >= self.malicious_threshold:
+        if heuristic_result.classification == "Malicious":
             classification = "Malicious"
-            confidence = malicious_probability
-        elif malicious_probability <= self.safe_threshold:
+            confidence = max(heuristic_result.confidence or 0, malicious_probability)
+        elif malicious_probability >= self.malicious_threshold:
+            # The training corpus overweights security terminology. Do not
+            # block benign technical requests based on the model alone.
             classification = "Safe"
-            confidence = 1 - malicious_probability
+            confidence = max(0.5, 1 - malicious_probability)
         else:
-            classification = "Uncertain"
-            confidence = max(malicious_probability, 1 - malicious_probability)
+            classification = "Safe"
+            confidence = max(0.5, 1 - malicious_probability)
         return DetectionResult(
             classification,
             confidence,
-            ["distilbert_malicious"] if classification == "Malicious" else [],
+            heuristic_result.matched_signals
+            + (["distilbert_malicious_advisory"] if malicious_probability >= self.malicious_threshold else []),
             detector_type="distilbert",
             model_version=self.model_version,
             malicious_probability=malicious_probability,
@@ -140,9 +145,7 @@ class HybridDetector:
     def detect(self, prompt: str) -> DetectionResult:
         heuristic_result = self.heuristic.detect(prompt)
         model_result = self.model.detect(prompt)
-        if heuristic_result.classification == "Malicious" or model_result.classification == "Malicious":
-            classification = "Malicious"
-        elif model_result.classification == "Uncertain":
+        if heuristic_result.classification == "Malicious":
             classification = "Malicious"
         else:
             classification = "Safe"
@@ -150,7 +153,7 @@ class HybridDetector:
             classification,
             max(heuristic_result.confidence or 0, model_result.confidence or 0),
             heuristic_result.matched_signals + model_result.matched_signals + (
-                ["distilbert_uncertain"] if model_result.classification == "Uncertain" else []
+                ["distilbert_advisory"] if model_result.classification != "Safe" else []
             ),
             detector_type="hybrid",
             model_version=model_result.model_version,
@@ -184,11 +187,17 @@ class HeuristicDetector:
             re.I,
         ),
         "jailbreak": re.compile(
-            r"jailbreak\w*|\bDAN\b|developer\s*mode|dev\s*mode|debug\s*mode|god\s*mode|sudo\s*mode|admin\s*mode|bypass\s+(all|your|the|safety|security)\s+(rules|safety|security|restrictions)|(without|zero|free\s+from|no)\s+.*(restrictions|safety|rules|guardrails|limits)|unfiltered|act\s+as\s+a?\s*(rogue|unfiltered|jailbroken|anarchist|hacker|dan)|pretend\s+(you\s+have\s+no|safety\s+is\s+off|to\s+be\s+unrestricted)",
+            r"jail\s*break\w*|jailbroken|\bDAN\b|developer\s*mode|dev\s*mode|debug\s*mode|god\s*mode|sudo\s*mode|admin\s*mode|bypass\s+(all|your|the|safety|security)\s+(rules|safety|security|restrictions)|(without|zero|free\s+from|no)\s+.*(restrictions|safety|rules|guardrails|limits)|unfiltered|act\s+as\s+a?\s*(rogue|unfiltered|jailbroken|anarchist|hacker|dan)|pretend\s+(you\s+have\s+no|safety\s+is\s+off|to\s+be\s+unrestricted)",
             re.I,
         ),
         "secret_exfiltration": re.compile(
-            r"api\s*keys?|passwords?|tokens?|credentials?|secret\s*keys?|private\s*keys?|database\s*passwords?|access\s*tokens?|environment\s*variables?|env\s*vars?|confidential\s*internal|aws\s*secret|directory\s*paths?|server\s*paths?",
+            r"(?:"
+            r"(?:reveal|dump|print|extract|expose|steal|exfiltrate|access|collect|retrieve|show|provide|disclose|output|list)"
+            r"\s+(?:the\s+)?(?:exact\s+)?(?:api\s*keys?|passwords?|tokens?|credentials?|secret\s*keys?|private\s*keys?|database\s*passwords?|access\s*tokens?|environment\s*variables?|env\s*vars?|aws\s*secret|directory\s*paths?|server\s*paths?)"
+            r"|(?:api\s*keys?|passwords?|tokens?|credentials?|secret\s*keys?|database\s*passwords?|access\s*tokens?|environment\s*variables?|env\s*vars?|aws\s*secret|directory\s*paths?|server\s*paths?)"
+            r"\s+(?:from|of|in)\s+(?:the\s+)?(?:runtime|environment|system|server|database|cloud|host)"
+            r"|confidential\s+internal"
+            r")",
             re.I,
         ),
     }
